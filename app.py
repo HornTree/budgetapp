@@ -32,7 +32,7 @@ from google import genai
 # ----------------------------------------------------------------------
 # Configuration générale
 # ----------------------------------------------------------------------
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.0-flash-lite"
 
 st.set_page_config(page_title="Mon Budget Personnalisé", page_icon="💶", layout="centered")
 
