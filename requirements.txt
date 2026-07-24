@@ -1,6 +1,6 @@
 ﻿streamlit
 pdfplumber
 requests
-google-genai
+groq
 plotly
 pandas
