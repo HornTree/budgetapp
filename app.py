@@ -3,20 +3,26 @@ Aurelion Wealth Management — Diagnostic Budgétaire & Plan d'Investissement
 ---------------------------------------------------------------------------
 Cette application :
 
-1. Recueille l'identité, le foyer, le logement et le bilan patrimonial
-   complet de l'utilisateur (Étape 1).
+1. Recueille l'identité, le foyer, le type de contrat de travail, le
+   logement et le bilan patrimonial complet de l'utilisateur (Étape 1).
+   Le salaire net peut être renseigné soit via l'import d'une fiche de
+   paie PDF (10 Mo max), soit par saisie manuelle directe.
 2. Évalue, de façon optionnelle, un profil d'aversion au risque
-   (Prudent / Équilibré / Dynamique) via un mini-QCM (Étape 2).
-3. Extrait le texte d'une fiche de paie PDF (pdfplumber, 10 Mo max) et en
-   déduit le salaire net via l'IA (Groq / llama-3.3-70b-versatile).
+   (Prudent / Équilibré / Dynamique) via un mini-QCM resserré à 3
+   questions non redondantes, complété d'une question de connaissances
+   financières utilisée pour adapter le ton du rapport (Étape 2).
+3. Si une fiche de paie a été importée, en extrait le texte (pdfplumber)
+   puis en déduit le salaire net via l'IA (Groq / llama-3.3-70b-versatile).
 4. Calcule, en deux temps :
      - Temps 1 : la répartition du budget mensuel (essentiels, impôts,
        plaisirs, capacité d'épargne).
      - Temps 2 : l'allocation de la capacité d'épargne (matelas de
-       sécurité, PER, investissement long terme), selon l'âge, la TMI,
-       le patrimoine existant et le profil de risque.
-5. Demande à Groq de rédiger un rapport Markdown structuré suivant
-   strictement ce plan en deux temps (Étape 3).
+       sécurité, PER, investissement long terme sécurisé/dynamique),
+       selon l'âge, la TMI, la stabilité du contrat de travail, le
+       patrimoine existant et le profil de risque.
+5. Demande à Groq de rédiger un rapport Markdown concis suivant
+   strictement ce plan en deux temps, avec un plan d'investissement
+   structuré nommant des supports concrets (Étape 3).
 
 Prérequis :
     pip install streamlit pdfplumber groq plotly pandas
@@ -46,6 +52,10 @@ from groq import Groq
 GROQ_MODEL = "llama-3.3-70b-versatile"
 TAILLE_MAX_FICHIER_MO = 10
 TAILLE_MAX_FICHIER_OCTETS = TAILLE_MAX_FICHIER_MO * 1024 * 1024
+
+# Types de contrat considérés comme précaires : ils augmentent la cible
+# de matelas de sécurité recommandée (Temps 2).
+CONTRATS_PRECAIRES = {"CDD", "Intérim", "Stage", "Alternance / Apprentissage", "Freelance / Indépendant"}
 
 st.set_page_config(page_title="Aurelion Wealth Management", page_icon="€", layout="centered")
 
@@ -157,12 +167,15 @@ Si tu ne trouves aucun montant, réponds avec :
 
 
 # ----------------------------------------------------------------------
-# PROFIL DE RISQUE — Mini-QCM optionnel
+# PROFIL DE RISQUE — Mini-QCM optionnel (resserré, sans redondance)
 # ----------------------------------------------------------------------
-# Chaque option est associée à un score de 1 (très prudent) à 3 (très
-# dynamique). Questions inspirées d'un questionnaire patrimonial classique
-# (horizon de placement, réaction aux baisses de marché, préférence
-# sécurité/rendement, épargne de précaution déjà constituée).
+# 3 questions alimentent le score de risque (horizon, tolérance aux
+# baisses de marché, préférence sécurité/rendement). La question sur
+# l'épargne de précaution déjà constituée a été retirée : elle faisait
+# doublon avec le champ "Épargne disponible" déjà saisi à l'Étape 1.
+# Une 4e question, sur les connaissances financières, est collectée
+# séparément : elle ne pèse pas sur le score de risque mais permet
+# d'adapter le niveau de pédagogie du rapport généré par l'IA.
 QUESTIONS_RISQUE = {
     "horizon": {
         "label": "Quel est votre horizon de placement pour l'épargne excédentaire ?",
@@ -189,21 +202,20 @@ QUESTIONS_RISQUE = {
             "100% de dynamisme (capital non garanti, potentiel de gain élevé)": 3,
         },
     },
-    "epargne_precaution": {
-        "label": "Quel est le montant de votre épargne de précaution déjà disponible (livrets, compte courant) ?",
-        "options": {
-            "Moins de 5 000 €": 1,
-            "Entre 5 000 € et 15 000 €": 2,
-            "Plus de 15 000 €": 3,
-        },
-    },
+}
+
+CONNAISSANCES_FINANCIERES = {
+    "Novice : je n'y connais pas grand-chose, j'ai besoin d'être guidé de A à Z": "Novice",
+    "Intermédiaire : je comprends les bases mais je manque de stratégie": "Intermédiaire",
+    "Expert : je gère déjà activement mes investissements": "Expert",
 }
 
 
 def calculer_profil_risque(reponses: dict) -> tuple[str, float]:
     """
-    Calcule un score moyen (1 à 3) à partir des réponses au QCM de risque,
-    puis en déduit un profil textuel : Prudent, Équilibré ou Dynamique.
+    Calcule un score moyen (1 à 3) à partir des réponses aux 3 questions
+    de risque, puis en déduit un profil textuel : Prudent, Équilibré ou
+    Dynamique.
 
     `reponses` est un dict {cle_question: libelle_option_choisie}.
     Retourne (profil, score_moyen). Si aucune réponse n'a été fournie,
@@ -301,29 +313,50 @@ def construire_allocation_temps2(
     age: int,
     tmi_pct: float,
     profil_risque: str,
+    contrat_type: str,
+    duree_restante_mois: float | None,
 ) -> dict:
     """
     TEMPS 2 : répartit la capacité d'épargne mensuelle (issue du Temps 1)
-    entre trois blocs, dans l'ordre de priorité patrimonial classique :
+    entre quatre blocs, dans l'ordre de priorité patrimonial classique :
 
     1. Matelas de sécurité : alimentation des livrets réglementés
-       jusqu'à atteindre une cible de 3 à 6 mois de charges essentielles
-       (cible resserrée à 3 mois pour un profil Dynamique, élargie à 6
-       mois pour un profil Prudent). Priorité forte tant que l'épargne
-       disponible couvre moins de 3 mois de charges.
+       jusqu'à atteindre une cible de mois de charges essentielles. La
+       cible de base dépend du profil de risque (3 mois pour un profil
+       Dynamique, 6 mois pour un profil Prudent) et est majorée pour les
+       contrats de travail précaires (CDD, intérim, stage, alternance,
+       freelance) — encore davantage si le contrat se termine dans moins
+       de 6 mois — et réduite pour les postes de titulaire de la
+       fonction publique, jugés plus stables.
     2. PER (optimisation fiscale/retraite) : pertinent surtout si la TMI
        est élevée (≥ 30%) et si l'âge laisse un horizon de placement
        raisonnable avant la retraite (< 60 ans), le PER bloquant les
        fonds jusqu'à cet âge.
-    3. Investissement long terme (PEA / Assurance-Vie / ETF / SCPI) :
-       reçoit le solde restant après matelas et PER.
+    3 et 4. Investissement long terme, sous-réparti entre un compartiment
+       sécurisé (fonds euro, obligataire) et un compartiment dynamique
+       (actions, ETF, SCPI), selon le profil de risque.
     """
     if depenses_essentielles > 0:
         mois_couverture_actuelle = round(epargne_disponible / depenses_essentielles, 1)
     else:
         mois_couverture_actuelle = 99.0  # pas de charges essentielles déclarées
 
-    cible_matelas_mois = {"Prudent": 6, "Équilibré": 4.5, "Dynamique": 3, "Non renseigné": 4.5}.get(profil_risque, 4.5)
+    base_cible = {"Prudent": 6, "Équilibré": 4.5, "Dynamique": 3, "Non renseigné": 4.5}.get(profil_risque, 4.5)
+
+    bonus_stabilite = {
+        "CDI": 0,
+        "Fonctionnaire / Titulaire": -1,
+        "CDD": 2,
+        "Intérim": 2,
+        "Stage": 2.5,
+        "Alternance / Apprentissage": 1.5,
+        "Freelance / Indépendant": 2,
+        "Autre": 1,
+    }.get(contrat_type, 0)
+    if contrat_type in CONTRATS_PRECAIRES and duree_restante_mois is not None and duree_restante_mois <= 6:
+        bonus_stabilite += 1
+
+    cible_matelas_mois = min(max(base_cible + bonus_stabilite, 3), 9)
     montant_cible_matelas = depenses_essentielles * cible_matelas_mois
     manque_matelas = max(montant_cible_matelas - epargne_disponible, 0.0)
 
@@ -333,7 +366,8 @@ def construire_allocation_temps2(
             "cible_matelas_mois": cible_matelas_mois,
             "montant_matelas": 0.0,
             "montant_per": 0.0,
-            "montant_invest_long_terme": 0.0,
+            "montant_invest_securise": 0.0,
+            "montant_invest_dynamique": 0.0,
         }
 
     # Taux d'effort vers le matelas selon le niveau de couverture actuel
@@ -358,14 +392,25 @@ def construire_allocation_temps2(
         taux_per = 0.0
     montant_per = round(reste_apres_matelas * taux_per, 2)
 
-    montant_invest_long_terme = round(reste_apres_matelas - montant_per, 2)
+    montant_invest_total = round(reste_apres_matelas - montant_per, 2)
+
+    repartition_invest = {
+        "Prudent": (0.70, 0.30),
+        "Équilibré": (0.45, 0.55),
+        "Dynamique": (0.20, 0.80),
+        "Non renseigné": (0.50, 0.50),
+    }
+    taux_securise, taux_dynamique = repartition_invest.get(profil_risque, (0.50, 0.50))
+    montant_invest_securise = round(montant_invest_total * taux_securise, 2)
+    montant_invest_dynamique = round(montant_invest_total - montant_invest_securise, 2)
 
     return {
         "mois_couverture_actuelle": mois_couverture_actuelle,
         "cible_matelas_mois": cible_matelas_mois,
         "montant_matelas": montant_matelas,
         "montant_per": montant_per,
-        "montant_invest_long_terme": montant_invest_long_terme,
+        "montant_invest_securise": montant_invest_securise,
+        "montant_invest_dynamique": montant_invest_dynamique,
     }
 
 
@@ -374,6 +419,7 @@ def construire_allocation_temps2(
 # ----------------------------------------------------------------------
 def generer_rapport(
     identite: dict,
+    emploi: dict,
     logement: dict,
     dettes: dict,
     patrimoine: dict,
@@ -381,17 +427,26 @@ def generer_rapport(
     temps2: dict,
     profil_risque: str,
     score_risque: float,
+    niveau_connaissance: str,
 ) -> str:
     """
     Construit un prompt détaillé décrivant l'ensemble de la situation du
-    foyer (identité, logement, dettes, patrimoine) ainsi que les montants
-    calculés par le moteur Temps 1 / Temps 2, puis demande à Groq de
-    rédiger un rapport Markdown structuré suivant strictement ce plan en
-    deux temps.
+    foyer (identité, emploi, logement, dettes, patrimoine) ainsi que les
+    montants calculés par le moteur Temps 1 / Temps 2, puis demande à
+    Groq de rédiger un rapport Markdown concis suivant strictement ce
+    plan en deux temps, avec un plan d'investissement structuré nommant
+    des supports concrets.
     """
-    prompt = f"""Tu es un conseiller en gestion de patrimoine, bienveillant, pédagogue et rigoureux.
-Rédige un rapport en Markdown clair et structuré à partir des données suivantes.
-Précise en une phrase, avant le Temps 1, que ce diagnostic est indicatif et ne remplace pas l'avis d'un conseiller en gestion de patrimoine agréé.
+    if emploi["duree_restante_mois"] is not None:
+        detail_contrat = f"{emploi['contrat_type']} — {emploi['duree_restante_mois']:.0f} mois restants"
+    else:
+        detail_contrat = emploi["contrat_type"]
+
+    prompt = f"""Tu es un conseiller en gestion de patrimoine, direct et rigoureux. Ton style est concis : pas de paragraphes longs, va à l'essentiel.
+Adapte ton niveau de vocabulaire au niveau de connaissances financières de l'utilisateur : {niveau_connaissance} (vulgarise davantage si Novice, sois plus technique si Expert).
+
+Rédige un rapport en Markdown à partir des données suivantes.
+Commence par une phrase (pas plus) précisant que ce diagnostic est indicatif et ne remplace pas l'avis d'un conseiller en gestion de patrimoine agréé.
 
 IDENTITÉ & FOYER :
 - Âge : {identite['age']} ans
@@ -399,6 +454,9 @@ IDENTITÉ & FOYER :
 - Nombre de parts fiscales : {identite['nb_parts_fiscales']}
 - Nombre d'adultes : {identite['nb_adultes']} / Nombre d'enfants : {identite['nb_enfants']}
 - Handicap / frais médicaux importants : {"Oui" if identite['handicap'] else "Non"}
+
+EMPLOI :
+- Type de contrat : {detail_contrat}
 
 LOGEMENT :
 - Statut : {logement['statut']}
@@ -420,27 +478,31 @@ BILAN PATRIMONIAL :
 
 RÉSULTATS DU MOTEUR DE CALCUL — TEMPS 1 (Répartition du budget mensuel) :
 - Revenu total mensuel : {temps1['revenu_total']:.2f} €
-- Dépenses essentielles (logement + charges + crédits hors immo) : {temps1['depenses_essentielles']:.2f} €
+- Dépenses essentielles : {temps1['depenses_essentielles']:.2f} €
 - Impôts & taxes estimés (approximation via la TMI) : {temps1['impots_mensuels']:.2f} €
 - Plaisirs / reste à vivre : {temps1['plaisirs']:.2f} €
 - Capacité d'épargne mensuelle calculée : {temps1['capacite_epargne']:.2f} €
-- Situation de déficit budgétaire ce mois-ci : {"Oui, le solde brut est de " + f"{temps1['reste_a_vivre_brut']:.2f} €" if temps1['deficit'] else "Non"}
+- Situation de déficit budgétaire ce mois-ci : {"Oui, solde brut de " + f"{temps1['reste_a_vivre_brut']:.2f} €" if temps1['deficit'] else "Non"}
 
 RÉSULTATS DU MOTEUR DE CALCUL — TEMPS 2 (Allocation de la capacité d'épargne) :
-- Couverture actuelle du matelas de sécurité : {temps2['mois_couverture_actuelle']:.1f} mois de charges essentielles (cible recommandée : {temps2['cible_matelas_mois']} mois)
+- Couverture actuelle du matelas de sécurité : {temps2['mois_couverture_actuelle']:.1f} mois de charges essentielles (cible : {temps2['cible_matelas_mois']} mois, ajustée selon le profil de risque et la stabilité du contrat)
 - Allocation Matelas de sécurité : {temps2['montant_matelas']:.2f} €
 - Allocation PER (optimisation fiscale/retraite) : {temps2['montant_per']:.2f} €
-- Allocation Investissement long terme (PEA / Assurance-Vie / ETF / SCPI) : {temps2['montant_invest_long_terme']:.2f} €
+- Allocation Investissement long terme sécurisé (fonds euro, obligataire) : {temps2['montant_invest_securise']:.2f} €
+- Allocation Investissement long terme dynamique (actions, ETF, SCPI) : {temps2['montant_invest_dynamique']:.2f} €
 
-CONSIGNES DE RÉDACTION :
-Structure le rapport en suivant EXACTEMENT ce plan, avec des titres Markdown (##) :
+CONSIGNES DE RÉDACTION (reste concis à chaque étape) :
 
-## Temps 1 — Répartition du budget mensuel et diagnostic de santé financière
-Un paragraphe de diagnostic (taille du foyer, présence de dettes, contexte médical si pertinent, situation de déficit éventuelle), puis un tableau Markdown (colonnes : Poste | Montant en € | % du revenu total) reprenant les 4 postes du Temps 1.
+## Temps 1 — Répartition du budget mensuel
+Diagnostic en 2-3 phrases MAXIMUM (taille du foyer, dettes, contexte médical si pertinent, déficit éventuel).
+Tableau Markdown (Poste | Montant en € | % du revenu total) reprenant les 4 postes.
+2 à 3 puces courtes expliquant POURQUOI cette répartition (pas de paragraphe).
 
 ## Temps 2 — Plan d'investissement personnalisé
-Un tableau Markdown (colonnes : Allocation | Montant en € | % de la capacité d'épargne) reprenant les 3 blocs du Temps 2, avec une phrase expliquant pourquoi cette allocation est cohérente avec l'âge, la TMI, le patrimoine existant et le profil de risque.
-Ensuite, une liste numérotée de 3 conseils pratiques et bienveillants, puis une "Feuille de route" numérotée de 3 à 5 actions concrètes à réaliser dès ce mois-ci.
+Tableau Markdown (Allocation | Montant en € | % de la capacité d'épargne) reprenant les 4 lignes du Temps 2.
+Un court paragraphe "Contexte de marché" (3-4 phrases maximum) donnant des repères généraux actuels par classe d'actifs (taux des livrets réglementés, fonds euro, tendances actions/obligations) utiles pour situer la décision — précise explicitement que ce sont des repères généraux et non une analyse de marché en temps réel, et qu'il faut vérifier les taux/conditions à jour avant toute décision.
+Section "Dans quoi investir concrètement" : pour chaque ligne du Temps 2 (hors matelas), nomme 1 à 2 supports précis (ex. ETF monde capitalisant, SCPI de rendement, fonds euro d'assurance-vie, PER en unités de compte, obligations d'État) avec une justification d'une ligne chacun, tenant compte de l'âge, du profil de risque, des produits déjà détenus et de la stabilité de l'emploi.
+"Feuille de route" : liste numérotée de 3 à 5 actions concrètes à réaliser dès ce mois-ci.
 
 Réponds uniquement avec le rapport en Markdown, sans phrase d'introduction avant le titre.
 """
@@ -459,8 +521,9 @@ if "resultat" not in st.session_state:
 # ----------------------------------------------------------------------
 st.title("Aurelion Wealth Management")
 st.caption(
-    "Renseignez votre situation complète, importez votre fiche de paie, et obtenez "
-    "un diagnostic budgétaire et un plan d'investissement personnalisés (IA Groq)."
+    "Renseignez votre situation complète, importez votre fiche de paie (ou saisissez votre "
+    "salaire net directement), et obtenez un diagnostic budgétaire et un plan "
+    "d'investissement personnalisés (IA Groq)."
 )
 
 etape1, etape2, etape3 = st.tabs(
@@ -469,7 +532,7 @@ etape1, etape2, etape3 = st.tabs(
 
 
 # ----------------------------------------------------------------------
-# ÉTAPE 1 — IDENTITÉ, FOYER, LOGEMENT, DETTES, PATRIMOINE, DOCUMENTS
+# ÉTAPE 1 — IDENTITÉ, EMPLOI, FOYER, LOGEMENT, DETTES, PATRIMOINE
 # ----------------------------------------------------------------------
 with etape1:
     st.subheader("Identité & Foyer")
@@ -495,6 +558,20 @@ with etape1:
     handicap = st.checkbox("Handicap / Frais médicaux importants")
 
     st.divider()
+    st.subheader("Emploi")
+    contrat_type = st.selectbox(
+        "Type de contrat *",
+        ["CDI", "CDD", "Intérim", "Stage", "Alternance / Apprentissage", "Freelance / Indépendant", "Fonctionnaire / Titulaire", "Autre"],
+    )
+    duree_restante_mois = None
+    if contrat_type in CONTRATS_PRECAIRES:
+        duree_restante_mois = st.number_input(
+            f"Durée restante du contrat actuel (mois) — {contrat_type} *",
+            min_value=0, max_value=60, value=6, step=1,
+        )
+        st.caption("Cette information affine la cible de matelas de sécurité recommandée (Étape 3).")
+
+    st.divider()
     st.subheader("Logement & Charges principales")
     statut_logement = st.selectbox(
         "Statut de résidence *",
@@ -505,11 +582,11 @@ with etape1:
         ],
     )
     if statut_logement == "Locataire":
-        label_montant_logement = "Loyer mensuel (€) *"
-        montant_logement = st.number_input(label_montant_logement, min_value=0.0, value=0.0, step=10.0, format="%.2f")
+        montant_logement = st.number_input("Loyer mensuel (€) *", min_value=0.0, value=0.0, step=10.0, format="%.2f")
     elif statut_logement == "Propriétaire avec crédit immobilier en cours":
-        label_montant_logement = "Mensualité du crédit immobilier (€) *"
-        montant_logement = st.number_input(label_montant_logement, min_value=0.0, value=0.0, step=10.0, format="%.2f")
+        montant_logement = st.number_input(
+            "Mensualité du crédit immobilier (€) *", min_value=0.0, value=0.0, step=10.0, format="%.2f"
+        )
     else:
         st.info("Aucun loyer ni mensualité de crédit à renseigner pour ce statut.")
         montant_logement = 0.0
@@ -566,19 +643,33 @@ with etape1:
     )
 
     st.divider()
-    st.subheader("Fiche de paie")
-    st.caption(f"Format PDF uniquement, {TAILLE_MAX_FICHIER_MO} Mo maximum par fichier.")
-    fichier_pdf = st.file_uploader("Importer votre fiche de paie (PDF)", type=["pdf"])
+    st.subheader("Salaire net")
+    mode_saisie_salaire = st.radio(
+        "Comment souhaitez-vous renseigner votre salaire net ? *",
+        ["Importer ma fiche de paie (PDF)", "Saisir le montant manuellement"],
+        horizontal=True,
+    )
 
-    if fichier_pdf is not None:
-        if fichier_pdf.size > TAILLE_MAX_FICHIER_OCTETS:
-            st.error(
-                f"Le fichier dépasse la limite autorisée de {TAILLE_MAX_FICHIER_MO} Mo "
-                f"({fichier_pdf.size / (1024 * 1024):.1f} Mo). Merci d'importer un fichier plus léger."
-            )
-            fichier_pdf = None
-        else:
-            st.success("Fichier importé. Rendez-vous dans l'Étape 3 pour lancer l'analyse.")
+    fichier_pdf = None
+    salaire_net_manuel = None
+
+    if mode_saisie_salaire == "Importer ma fiche de paie (PDF)":
+        st.caption(f"Format PDF uniquement, {TAILLE_MAX_FICHIER_MO} Mo maximum par fichier.")
+        fichier_pdf = st.file_uploader("Importer votre fiche de paie (PDF)", type=["pdf"])
+
+        if fichier_pdf is not None:
+            if fichier_pdf.size > TAILLE_MAX_FICHIER_OCTETS:
+                st.error(
+                    f"Le fichier dépasse la limite autorisée de {TAILLE_MAX_FICHIER_MO} Mo "
+                    f"({fichier_pdf.size / (1024 * 1024):.1f} Mo). Merci d'importer un fichier plus léger."
+                )
+                fichier_pdf = None
+            else:
+                st.success("Fichier importé. Rendez-vous dans l'Étape 3 pour lancer l'analyse.")
+    else:
+        salaire_net_manuel = st.number_input(
+            "Salaire net mensuel (€) *", min_value=0.0, value=0.0, step=10.0, format="%.2f"
+        )
 
     st.info("Passez ensuite à l'Étape 2 (facultative) ou directement à l'Étape 3.")
 
@@ -596,7 +687,8 @@ with etape2:
 
     repondre_qcm = st.checkbox("Je souhaite renseigner mon profil de risque")
 
-    reponses_risque = {"horizon": None, "reaction_baisse": None, "preference_repartition": None, "epargne_precaution": None}
+    reponses_risque = {"horizon": None, "reaction_baisse": None, "preference_repartition": None}
+    niveau_connaissance = "Non renseigné"
 
     if repondre_qcm:
         for cle, question in QUESTIONS_RISQUE.items():
@@ -606,6 +698,14 @@ with etape2:
                 index=None,
                 key=f"risque_{cle}",
             )
+
+        connaissance_choisie = st.radio(
+            "Comment évaluez-vous vos connaissances financières ?",
+            options=list(CONNAISSANCES_FINANCIERES.keys()),
+            index=None,
+            key="connaissances_financieres",
+        )
+        niveau_connaissance = CONNAISSANCES_FINANCIERES.get(connaissance_choisie, "Non renseigné")
 
         profil_risque, score_risque = calculer_profil_risque(reponses_risque)
         if profil_risque != "Non renseigné":
@@ -626,93 +726,106 @@ with etape3:
     lancer = st.button("Lancer l'analyse IA", use_container_width=True, type="primary")
 
     if lancer:
-        if fichier_pdf is None:
-            st.warning("Merci d'importer une fiche de paie valide (Étape 1) avant de continuer.")
-        else:
-            with st.spinner("Lecture du PDF en cours..."):
-                texte_pdf = extraire_texte_pdf(fichier_pdf)
+        salaire_net = None
 
-            if not texte_pdf:
-                st.error("Le texte n'a pas pu être extrait du PDF (fichier scanné/image ou vide).")
+        if mode_saisie_salaire == "Saisir le montant manuellement":
+            if salaire_net_manuel and salaire_net_manuel > 0:
+                salaire_net = salaire_net_manuel
             else:
-                with st.expander("Voir le texte extrait de la fiche de paie"):
-                    st.text(texte_pdf)
+                st.warning("Merci de saisir un salaire net mensuel valide (Étape 1) avant de continuer.")
+        else:
+            if fichier_pdf is None:
+                st.warning("Merci d'importer une fiche de paie valide (Étape 1) avant de continuer.")
+            else:
+                with st.spinner("Lecture du PDF en cours..."):
+                    texte_pdf = extraire_texte_pdf(fichier_pdf)
 
-                with st.spinner("Extraction du salaire net via Groq..."):
-                    salaire_net = extraire_salaire_net(texte_pdf)
+                if not texte_pdf:
+                    st.error("Le texte n'a pas pu être extrait du PDF (fichier scanné/image ou vide).")
+                else:
+                    with st.expander("Voir le texte extrait de la fiche de paie"):
+                        st.text(texte_pdf)
 
-                if salaire_net is None:
-                    st.error(
-                        "Le salaire net n'a pas pu être détecté automatiquement. "
-                        "Renseignez-le manuellement ci-dessous."
-                    )
-                    salaire_net = st.number_input(
-                        "Salaire net mensuel (€) — saisie manuelle", min_value=0.0, value=0.0, step=10.0
-                    )
+                    with st.spinner("Extraction du salaire net via Groq..."):
+                        salaire_net = extraire_salaire_net(texte_pdf)
 
-                if salaire_net and salaire_net > 0:
-                    st.success(f"Salaire net détecté : {salaire_net:.2f} €")
-
-                    nb_personnes = nb_adultes + nb_enfants
-
-                    temps1 = calculer_budget_temps1(
-                        salaire_net=salaire_net,
-                        autres_revenus=autres_revenus,
-                        montant_logement=montant_logement,
-                        autres_charges_essentielles=autres_charges_essentielles,
-                        mensualite_dette_hors_immo=mensualite_dette,
-                        tmi_pct=tmi_pct,
-                        handicap=handicap,
-                        nb_personnes=nb_personnes,
-                    )
-
-                    temps2 = construire_allocation_temps2(
-                        capacite_epargne=temps1["capacite_epargne"],
-                        depenses_essentielles=temps1["depenses_essentielles"],
-                        epargne_disponible=epargne_disponible,
-                        age=age,
-                        tmi_pct=tmi_pct,
-                        profil_risque=profil_risque,
-                    )
-
-                    identite = {
-                        "age": age,
-                        "situation_matrimoniale": situation_matrimoniale,
-                        "nb_parts_fiscales": nb_parts_fiscales,
-                        "nb_adultes": nb_adultes,
-                        "nb_enfants": nb_enfants,
-                        "handicap": handicap,
-                    }
-                    logement = {
-                        "statut": statut_logement,
-                        "montant": montant_logement,
-                        "autres_charges": autres_charges_essentielles,
-                    }
-                    dettes = {"montant_total": montant_dette, "mensualite": mensualite_dette}
-                    patrimoine = {
-                        "salaire_net": salaire_net,
-                        "autres_revenus": autres_revenus,
-                        "epargne_disponible": epargne_disponible,
-                        "epargne_long_terme": epargne_long_terme,
-                        "produits_detenus": ", ".join(produits_detenus) if produits_detenus else "Aucun déclaré",
-                        "tmi_pct": tmi_pct,
-                    }
-
-                    with st.spinner("Rédaction du rapport personnalisé via Groq..."):
-                        rapport = generer_rapport(
-                            identite=identite,
-                            logement=logement,
-                            dettes=dettes,
-                            patrimoine=patrimoine,
-                            temps1=temps1,
-                            temps2=temps2,
-                            profil_risque=profil_risque,
-                            score_risque=score_risque,
+                    if salaire_net is None:
+                        st.error(
+                            "Le salaire net n'a pas pu être détecté automatiquement. "
+                            "Renseignez-le manuellement ci-dessous."
+                        )
+                        salaire_net = st.number_input(
+                            "Salaire net mensuel (€) — saisie manuelle", min_value=0.0, value=0.0, step=10.0
                         )
 
-                    st.session_state.resultat = (temps1, temps2, rapport)
-                else:
-                    st.info("Renseignez un salaire net valide pour lancer le calcul du budget.")
+        if salaire_net and salaire_net > 0:
+            st.success(f"Salaire net retenu : {salaire_net:.2f} €")
+
+            nb_personnes = nb_adultes + nb_enfants
+
+            temps1 = calculer_budget_temps1(
+                salaire_net=salaire_net,
+                autres_revenus=autres_revenus,
+                montant_logement=montant_logement,
+                autres_charges_essentielles=autres_charges_essentielles,
+                mensualite_dette_hors_immo=mensualite_dette,
+                tmi_pct=tmi_pct,
+                handicap=handicap,
+                nb_personnes=nb_personnes,
+            )
+
+            temps2 = construire_allocation_temps2(
+                capacite_epargne=temps1["capacite_epargne"],
+                depenses_essentielles=temps1["depenses_essentielles"],
+                epargne_disponible=epargne_disponible,
+                age=age,
+                tmi_pct=tmi_pct,
+                profil_risque=profil_risque,
+                contrat_type=contrat_type,
+                duree_restante_mois=duree_restante_mois,
+            )
+
+            identite = {
+                "age": age,
+                "situation_matrimoniale": situation_matrimoniale,
+                "nb_parts_fiscales": nb_parts_fiscales,
+                "nb_adultes": nb_adultes,
+                "nb_enfants": nb_enfants,
+                "handicap": handicap,
+            }
+            emploi = {"contrat_type": contrat_type, "duree_restante_mois": duree_restante_mois}
+            logement = {
+                "statut": statut_logement,
+                "montant": montant_logement,
+                "autres_charges": autres_charges_essentielles,
+            }
+            dettes = {"montant_total": montant_dette, "mensualite": mensualite_dette}
+            patrimoine = {
+                "salaire_net": salaire_net,
+                "autres_revenus": autres_revenus,
+                "epargne_disponible": epargne_disponible,
+                "epargne_long_terme": epargne_long_terme,
+                "produits_detenus": ", ".join(produits_detenus) if produits_detenus else "Aucun déclaré",
+                "tmi_pct": tmi_pct,
+            }
+
+            with st.spinner("Rédaction du rapport personnalisé via Groq..."):
+                rapport = generer_rapport(
+                    identite=identite,
+                    emploi=emploi,
+                    logement=logement,
+                    dettes=dettes,
+                    patrimoine=patrimoine,
+                    temps1=temps1,
+                    temps2=temps2,
+                    profil_risque=profil_risque,
+                    score_risque=score_risque,
+                    niveau_connaissance=niveau_connaissance,
+                )
+
+            st.session_state.resultat = (temps1, temps2, rapport)
+        elif mode_saisie_salaire == "Importer ma fiche de paie (PDF)" and fichier_pdf is not None:
+            st.info("Renseignez un salaire net valide pour lancer le calcul du budget.")
 
     # --- Affichage du résultat le plus récent, s'il existe ---
     if st.session_state.resultat is not None:
@@ -767,21 +880,24 @@ with etape3:
         st.subheader("Temps 2 — Plan d'investissement personnalisé")
         st.caption(
             f"Couverture actuelle du matelas de sécurité : {temps2['mois_couverture_actuelle']:.1f} mois de "
-            f"charges essentielles (cible recommandée : {temps2['cible_matelas_mois']} mois)."
+            f"charges essentielles (cible recommandée : {temps2['cible_matelas_mois']} mois, ajustée selon "
+            "le profil de risque et la stabilité du contrat de travail)."
         )
 
-        col5, col6, col7 = st.columns(3)
+        col5, col6, col7, col8 = st.columns(4)
         col5.metric("Matelas de sécurité", f"{temps2['montant_matelas']:.2f} €")
         col6.metric("PER (fiscal / retraite)", f"{temps2['montant_per']:.2f} €")
-        col7.metric("Investissement long terme", f"{temps2['montant_invest_long_terme']:.2f} €")
+        col7.metric("Investissement sécurisé", f"{temps2['montant_invest_securise']:.2f} €")
+        col8.metric("Investissement dynamique", f"{temps2['montant_invest_dynamique']:.2f} €")
 
         df_temps2 = pd.DataFrame(
             {
-                "Allocation": ["Matelas de sécurité", "PER", "Investissement long terme"],
+                "Allocation": ["Matelas de sécurité", "PER", "Investissement sécurisé", "Investissement dynamique"],
                 "Montant (€)": [
                     temps2["montant_matelas"],
                     temps2["montant_per"],
-                    temps2["montant_invest_long_terme"],
+                    temps2["montant_invest_securise"],
+                    temps2["montant_invest_dynamique"],
                 ],
             }
         )
@@ -792,7 +908,7 @@ with etape3:
                     y=df_temps2["Montant (€)"],
                     text=df_temps2["Montant (€)"].map(lambda v: f"{v:.0f} €"),
                     textposition="outside",
-                    marker_color=["#4C78A8", "#F58518", "#54A24B"],
+                    marker_color=["#4C78A8", "#F58518", "#54A24B", "#E45756"],
                 )
             ]
         )
@@ -813,8 +929,10 @@ with etape3:
 
         st.caption(
             "Ce diagnostic est fourni à titre indicatif et ne constitue pas un conseil en "
-            "investissement personnalisé au sens réglementaire. Consultez un conseiller en "
-            "gestion de patrimoine agréé avant toute décision."
+            "investissement personnalisé au sens réglementaire. Les repères de marché mentionnés "
+            "proviennent des connaissances générales du modèle d'IA, pas d'une donnée de marché "
+            "en temps réel : vérifiez les taux et conditions actuels avant toute décision, et "
+            "consultez un conseiller en gestion de patrimoine agréé."
         )
     elif not lancer:
         st.info("Complétez l'Étape 1 (et éventuellement l'Étape 2), puis cliquez sur \"Lancer l'analyse IA\".")
