@@ -1,6 +1,6 @@
-﻿streamlit
+streamlit
 pdfplumber
-requests
 groq
 plotly
 pandas
+pillow
