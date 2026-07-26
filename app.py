@@ -62,7 +62,7 @@ from groq import Groq
 GROQ_MODEL = "llama-3.3-70b-versatile"
 TAILLE_MAX_FICHIER_MO = 10
 TAILLE_MAX_FICHIER_OCTETS = TAILLE_MAX_FICHIER_MO * 1024 * 1024
-CHEMIN_LOGO = "assets/aurelion_logo.jpg"
+CHEMIN_LOGO = "aurelion_logo.jpg"
 
 # Régions dont le coût de la vie est jugé structurellement élevé (loyers,
 # transport, alimentation). Simplification volontaire : ce n'est pas un
