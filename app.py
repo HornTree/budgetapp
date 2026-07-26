@@ -62,7 +62,7 @@ from groq import Groq
 GROQ_MODEL = "llama-3.3-70b-versatile"
 TAILLE_MAX_FICHIER_MO = 10
 TAILLE_MAX_FICHIER_OCTETS = TAILLE_MAX_FICHIER_MO * 1024 * 1024
-CHEMIN_LOGO = "aurelion_logo.jpg"
+CHEMIN_LOGO = "assets/aurelion_logo.jpg"
 
 # Régions dont le coût de la vie est jugé structurellement élevé (loyers,
 # transport, alimentation). Simplification volontaire : ce n'est pas un
@@ -85,19 +85,21 @@ TEXTE_AIDE_TMI = (
 st.set_page_config(page_title="Aurelion Wealth Management", page_icon=CHEMIN_LOGO, layout="centered")
 
 # ----------------------------------------------------------------------
-# IDENTITÉ VISUELLE — Charte bleu marine / or, style minimaliste et sobre
+# IDENTITÉ VISUELLE — Charte noir / or, style minimaliste et sobre
 # ----------------------------------------------------------------------
 st.markdown(
     """
     <style>
-    h1, h2, h3 { color: #0A1F44; font-weight: 600; letter-spacing: 0.3px; }
-    hr { border: none; border-top: 1px solid #C9A44C; margin: 1.4em 0; }
+    h1, h2, h3 { color: #D4AF6A; font-weight: 600; letter-spacing: 0.3px; }
+    hr { border: none; border-top: 1px solid #D4AF6A; margin: 1.4em 0; }
     div.stButton > button[kind="primary"] {
-        background-color: #C9A44C; color: #0A1F44; border: none; font-weight: 600;
+        background-color: #D4AF6A; color: #0B0B0B; border: none; font-weight: 600;
     }
-    div.stButton > button[kind="primary"]:hover { background-color: #B8943F; color: #FFFFFF; }
-    div[data-testid="stMetricValue"] { color: #0A1F44; }
-    .stTabs [data-baseweb="tab-highlight"] { background-color: #C9A44C; }
+    div.stButton > button[kind="primary"]:hover { background-color: #B8943F; color: #000000; }
+    div[data-testid="stMetricValue"] { color: #D4AF6A; }
+    div[data-testid="stMetricLabel"] { color: #EDE6D3; }
+    .stTabs [data-baseweb="tab-highlight"] { background-color: #D4AF6A; }
+    .stTabs [aria-selected="true"] { color: #D4AF6A !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -277,6 +279,28 @@ def calculer_profil_risque(reponses: dict) -> tuple[str, float]:
 # ----------------------------------------------------------------------
 # MOTEUR DE CALCUL — TEMPS 1 : Reste à Vivre Réel & répartition
 # ----------------------------------------------------------------------
+def determiner_taux_plafond_plaisir_base(revenu_total: float) -> float:
+    """
+    Barème progressif du plafond "Plaisirs", exprimé en % du revenu total.
+    Plus le revenu est élevé, plus la part destinée aux loisirs est
+    resserrée : au-delà d'un certain niveau de vie, l'excédent doit
+    prioritairement renforcer l'épargne plutôt que gonfler les dépenses
+    de confort (règle d'allocation stricte imposée par le cahier des
+    charges : ne pas laisser un gros salaire faire mécaniquement exploser
+    la ligne loisirs au détriment de la capacité d'épargne).
+    """
+    if revenu_total < 2000:
+        return 0.22
+    elif revenu_total < 3000:
+        return 0.20
+    elif revenu_total < 4500:
+        return 0.17
+    elif revenu_total < 6000:
+        return 0.14
+    else:
+        return 0.11
+
+
 def calculer_budget_temps1(
     salaire_net: float,
     autres_revenus: float,
@@ -315,13 +339,18 @@ def calculer_budget_temps1(
     reste_a_vivre = max(reste_a_vivre_brut, 0.0)
 
     # Plafond "Plaisirs" en % du revenu total (et non du reste à vivre) :
-    # c'est ce qui empêche un excédent important de gonfler les loisirs.
-    taux_plafond_plaisir = 0.25 if zone_cout_vie == "Élevé" else 0.20
+    # barème progressif (voir determiner_taux_plafond_plaisir_base), puis
+    # ajusté à la marge selon la région et le contexte du foyer. C'est ce
+    # qui empêche un excédent important de gonfler les loisirs : tout le
+    # surplus au-delà du plafond bascule automatiquement en épargne.
+    taux_plafond_plaisir = determiner_taux_plafond_plaisir_base(revenu_total)
+    if zone_cout_vie == "Élevé":
+        taux_plafond_plaisir += 0.05
     if handicap:
         taux_plafond_plaisir -= 0.05
     elif nb_personnes > 3:
         taux_plafond_plaisir -= 0.03
-    taux_plafond_plaisir = max(taux_plafond_plaisir, 0.10)
+    taux_plafond_plaisir = max(taux_plafond_plaisir, 0.08)
 
     plafond_plaisir_montant = round(revenu_total * taux_plafond_plaisir, 2)
     plaisirs = round(min(reste_a_vivre, plafond_plaisir_montant), 2)
@@ -342,6 +371,21 @@ def calculer_budget_temps1(
 # ----------------------------------------------------------------------
 # MOTEUR DE CALCUL — TEMPS 2 : Allocation de la capacité d'épargne
 # ----------------------------------------------------------------------
+SEUIL_MINIMUM_LIGNE_EUROS = 50.0
+
+
+def appliquer_seuil_minimum(montant: float, seuil: float = SEUIL_MINIMUM_LIGNE_EUROS) -> float:
+    """
+    Règle d'allocation stricte : interdit toute ligne d'investissement
+    mensuelle strictement comprise entre 0 et le seuil (50 € par défaut).
+    Un montant insignifiant (ex. 14,50 €) est ramené à 0 — la somme
+    correspondante reste alors dans le reste à répartir et sera captée
+    par la ligne suivante (typiquement l'Investissement Long Terme, qui
+    fait office de ligne "réceptacle" en bout de cascade).
+    """
+    return 0.0 if 0 < montant < seuil else round(montant, 2)
+
+
 def obtenir_bonus_stabilite(statut_professionnel: str, sous_statut: str | None, duree_restante_mois: float | None) -> float:
     """
     Détermine, en mois de charges essentielles supplémentaires, la
@@ -390,16 +434,24 @@ def construire_allocation_temps2(
        majorée pour les statuts professionnels précaires (CDD proche de
        son terme, intérim, stage, indépendant, demandeur d'emploi) et
        réduite pour les statuts jugés très stables (fonctionnaire,
-       retraité).
-    2. PER (optimisation fiscale/retraite) : pertinent si la TMI est
-       élevée (≥ 30%) et l'âge laisse un horizon avant la retraite
-       (< 60 ans). Toujours nul pour un statut "Retraité" (déjà en phase
-       de décaissement).
+       retraité). Règle stricte : dès que la cible est atteinte, ce
+       poste tombe à 0 € exactement (jamais un reliquat symbolique).
+    2. PER (optimisation fiscale/retraite) : n'est proposé QUE si le
+       matelas de sécurité est déjà rempli ET que la TMI est élevée
+       (≥ 30%) et l'âge laisse un horizon avant la retraite (< 60 ans).
+       Toujours nul pour un statut "Retraité" (déjà en phase de
+       décaissement) ou tant que le matelas n'est pas constitué.
     3. Investissement long terme (PEA / Assurance-Vie / ETF / SCPI) :
-       reçoit le solde. Une part indicative "dynamique" (actions/ETF)
-       vs "défensive" (fonds euro/obligataire) est suggérée selon le
-       profil de risque et l'âge, à titre de repère pour l'IA — la
-       répartition précise entre supports est détaillée dans le rapport.
+       reçoit le solde, et sert de ligne "réceptacle" pour tout montant
+       écarté par la règle du seuil minimum (voir appliquer_seuil_minimum).
+       Une part indicative "dynamique" (actions/ETF) vs "défensive"
+       (fonds euro/obligataire) est suggérée selon le profil de risque
+       et l'âge, à titre de repère pour l'IA — la répartition précise
+       entre supports est détaillée dans le rapport.
+
+    Règle stricte n°4 : aucune ligne (matelas, PER) n'est jamais affichée
+    entre 0 et 50 € — un montant sous ce seuil est ramené à 0 et absorbé
+    par l'Investissement Long Terme.
     """
     if depenses_essentielles > 0:
         mois_couverture_actuelle = round(epargne_disponible / depenses_essentielles, 1)
@@ -410,8 +462,10 @@ def construire_allocation_temps2(
     bonus_stabilite = obtenir_bonus_stabilite(statut_professionnel, sous_statut, duree_restante_mois)
     cible_matelas_mois = min(max(base_cible + bonus_stabilite, 3), 9)
 
-    montant_cible_matelas = depenses_essentielles * cible_matelas_mois
-    manque_matelas = max(montant_cible_matelas - epargne_disponible, 0.0)
+    # Règle stricte n°2 : dès que la cible de couverture est atteinte, le
+    # matelas de sécurité ne reçoit plus un centime (pas de "trickle"
+    # symbolique de quelques euros) — tout continue vers le PER / l'investissement.
+    matelas_rempli = mois_couverture_actuelle >= cible_matelas_mois
 
     # Part "dynamique" recommandée au sein du bloc investissement long
     # terme, à titre indicatif pour la rédaction du rapport (pas une
@@ -427,38 +481,48 @@ def construire_allocation_temps2(
         return {
             "mois_couverture_actuelle": mois_couverture_actuelle,
             "cible_matelas_mois": cible_matelas_mois,
+            "matelas_rempli": matelas_rempli,
             "montant_matelas": 0.0,
             "montant_per": 0.0,
             "montant_invest_long_terme": 0.0,
             "part_dynamique_pct": part_dynamique_pct,
         }
 
-    if mois_couverture_actuelle < 3:
+    if matelas_rempli:
+        taux_matelas = 0.0
+    elif mois_couverture_actuelle < 3:
         taux_matelas = 0.60
-    elif mois_couverture_actuelle < cible_matelas_mois:
-        taux_matelas = 0.30
     else:
-        taux_matelas = 0.05
+        taux_matelas = 0.30
 
-    montant_matelas = round(capacite_epargne * taux_matelas, 2)
-    if manque_matelas <= 0:
-        montant_matelas = round(min(montant_matelas, capacite_epargne * 0.05), 2)
-
+    montant_matelas_brut = round(capacite_epargne * taux_matelas, 2)
+    montant_matelas = appliquer_seuil_minimum(montant_matelas_brut)
     reste_apres_matelas = round(capacite_epargne - montant_matelas, 2)
 
-    if statut_professionnel == "Retraité":
+    # Règle stricte n°3 : le PER n'est proposé QUE si le matelas de
+    # sécurité est déjà rempli ET que la TMI est élevée (≥ 30%) — jamais
+    # en concurrence avec la constitution de l'épargne de précaution.
+    if not matelas_rempli:
+        taux_per = 0.0
+    elif statut_professionnel == "Retraité":
         taux_per = 0.0
     elif tmi_pct >= 30 and age < 60:
         taux_per = 0.30 if tmi_pct >= 41 else 0.20
     else:
         taux_per = 0.0
-    montant_per = round(reste_apres_matelas * taux_per, 2)
 
+    montant_per_brut = round(reste_apres_matelas * taux_per, 2)
+    montant_per = appliquer_seuil_minimum(montant_per_brut)
+
+    # L'Investissement Long Terme est la ligne "réceptacle" : elle
+    # récupère automatiquement tout montant écarté par le seuil minimum
+    # (règle stricte n°4), sans qu'aucune ligne ne repasse sous 50 €.
     montant_invest_long_terme = round(reste_apres_matelas - montant_per, 2)
 
     return {
         "mois_couverture_actuelle": mois_couverture_actuelle,
         "cible_matelas_mois": cible_matelas_mois,
+        "matelas_rempli": matelas_rempli,
         "montant_matelas": montant_matelas,
         "montant_per": montant_per,
         "montant_invest_long_terme": montant_invest_long_terme,
@@ -505,6 +569,11 @@ def generer_rapport(
 Adapte ton niveau de vocabulaire au niveau de connaissances financières de l'utilisateur : {niveau_connaissance} (vulgarise davantage si Novice, sois plus technique si Expert).
 Adapte tes conseils retraite/prévoyance et ta gestion de la trésorerie selon le statut professionnel : si Entrepreneur/Indépendant, aborde la trésorerie de précaution professionnelle, la prévoyance (arrêt maladie/invalidité) et le PER adapté à des revenus irréguliers ; si Retraité, ne recommande jamais de PER (déjà en phase de décaissement) mais privilégie la transmission et l'assurance-vie ; si Demandeur d'emploi, priorise la reconstitution du matelas de sécurité avant tout investissement ; si Fonctionnaire, tu peux mentionner la Préfon-Retraite en complément du PER.
 
+Respecte STRICTEMENT les règles d'allocation suivantes, sans jamais les contredire ni proposer de montants différents dans ton texte :
+- N'invente jamais une ligne d'allocation mensuelle inférieure à 50 € (sauf 0 €) : les montants fournis ci-dessous respectent déjà cette règle, reprends-les tels quels.
+- Si l'épargne de précaution affichée est à 0 €, explique que la cible de mois de couverture est déjà atteinte — ne suggère pas d'y ajouter un petit montant "par prudence".
+- Le PER n'est proposé que si le matelas de sécurité est rempli ET la TMI ≥ 30% : si son montant est à 0 €, n'insiste pas dessus, oriente plutôt vers l'investissement long terme ou la poursuite du matelas.
+
 Rédige un rapport en Markdown à partir des données suivantes.
 Commence par une phrase (pas plus) précisant que ce diagnostic est indicatif et ne remplace pas l'avis d'un conseiller en gestion de patrimoine agréé.
 
@@ -549,6 +618,7 @@ RÉSULTATS DU MOTEUR DE CALCUL — TEMPS 1 (Reste à Vivre Réel & répartition)
 
 RÉSULTATS DU MOTEUR DE CALCUL — TEMPS 2 (Allocation de la capacité d'épargne) :
 - Couverture actuelle du matelas de sécurité : {temps2['mois_couverture_actuelle']:.1f} mois de charges essentielles (cible : {temps2['cible_matelas_mois']} mois, ajustée selon le profil de risque et le statut professionnel)
+- Matelas de sécurité déjà rempli : {"Oui" if temps2['matelas_rempli'] else "Non"}
 - Allocation Épargne de précaution : {temps2['montant_matelas']:.2f} €
 - Allocation PER (optimisation fiscale/retraite) : {temps2['montant_per']:.2f} €
 - Allocation Investissement long terme : {temps2['montant_invest_long_terme']:.2f} € (dont environ {temps2['part_dynamique_pct']:.0f}% à orienter vers des supports dynamiques, le reste vers des supports défensifs)
@@ -973,7 +1043,8 @@ with etape3:
                     y=df_temps1["Montant (€)"],
                     text=df_temps1["Montant (€)"].map(lambda v: f"{v:.0f} €"),
                     textposition="outside",
-                    marker_color=["#0A1F44", "#7A8CA8", "#C9A44C", "#2E7D5B"],
+                    textfont=dict(color="#EDE6D3"),
+                    marker_color=["#8C6B2F", "#5C4A2E", "#D4AF6A", "#EDE6D3"],
                 )
             ]
         )
@@ -984,15 +1055,19 @@ with etape3:
             margin=dict(t=50, b=20),
             plot_bgcolor="rgba(0,0,0,0)",
             paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#EDE6D3"),
+            xaxis=dict(gridcolor="#2A2A2A", linecolor="#3A3A3A"),
+            yaxis=dict(gridcolor="#2A2A2A", linecolor="#3A3A3A"),
         )
         st.plotly_chart(fig1, use_container_width=True)
 
         st.divider()
         st.subheader("Temps 2 — Plan d'investissement personnalisé")
+        statut_matelas = "déjà rempli, plus aucune allocation nécessaire" if temps2["matelas_rempli"] else "en cours de constitution"
         st.caption(
             f"Couverture actuelle : {temps2['mois_couverture_actuelle']:.1f} mois de charges essentielles "
             f"(cible recommandée : {temps2['cible_matelas_mois']} mois, ajustée selon le profil de risque "
-            "et le statut professionnel)."
+            f"et le statut professionnel) — matelas {statut_matelas}."
         )
 
         col5, col6, col7 = st.columns(3)
@@ -1017,7 +1092,8 @@ with etape3:
                     y=df_temps2["Montant (€)"],
                     text=df_temps2["Montant (€)"].map(lambda v: f"{v:.0f} €"),
                     textposition="outside",
-                    marker_color=["#0A1F44", "#C9A44C", "#2E7D5B"],
+                    textfont=dict(color="#EDE6D3"),
+                    marker_color=["#8C6B2F", "#D4AF6A", "#EDE6D3"],
                 )
             ]
         )
@@ -1028,6 +1104,9 @@ with etape3:
             margin=dict(t=50, b=20),
             plot_bgcolor="rgba(0,0,0,0)",
             paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#EDE6D3"),
+            xaxis=dict(gridcolor="#2A2A2A", linecolor="#3A3A3A"),
+            yaxis=dict(gridcolor="#2A2A2A", linecolor="#3A3A3A"),
         )
         st.plotly_chart(fig2, use_container_width=True)
 
