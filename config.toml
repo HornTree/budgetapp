@@ -1,0 +1,11 @@
+[server]
+# Taille maximale (en Mo) d'un fichier importé via st.file_uploader.
+maxUploadSize = 10
+
+[theme]
+# Charte graphique Aurelion Wealth Management : bleu marine / or, sobre.
+primaryColor = "#C9A44C"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F5F7"
+textColor = "#0A1F44"
+font = "sans serif"
