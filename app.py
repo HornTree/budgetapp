@@ -18,8 +18,8 @@ Cette application :
 4. Calcule, en deux temps :
      - Temps 1 : Reste à Vivre Réel = Revenu - (Charges fixes + Impôts).
        La catégorie "Plaisirs" est plafonnée à un pourcentage raisonnable
-       du revenu (15 à 25%, ajusté selon la zone du code postal et le foyer) : tout
-       l'excédent au-delà de ce plafond bascule automatiquement dans la
+       du revenu (8 à 27%, ajusté selon la zone du code postal et le foyer) :
+       tout l'excédent au-delà de ce plafond bascule automatiquement dans la
        capacité d'épargne, au lieu d'être surdimensionné.
      - Temps 2 : l'allocation de la capacité d'épargne (épargne de
        précaution, PER, investissement long terme), selon l'âge, la TMI,
@@ -27,14 +27,20 @@ Cette application :
        risque.
 5. Demande à Groq de rédiger un rapport Markdown concis suivant
    strictement ce plan en deux temps, avec un plan d'investissement
-   structuré nommant des supports concrets (Étape 3).
+   structuré nommant des supports concrets, puis l'affiche avec des
+   graphiques de répartition (Étape 3).
+6. Propose un espace de discussion libre avec l'IA (Étape 4), qui
+   s'appuie sur le dernier diagnostic généré pour répondre aux questions
+   du client sur ses finances ou un projet d'investissement.
 
 Prérequis :
-    pip install streamlit pdfplumber groq plotly pandas pillow
+    pip install -r requirements.txt
 
 Clé API :
     Ajoutez votre clé dans .streamlit/secrets.toml :
         GROQ_API_KEY = "votre_cle_api"
+    (ou définissez la variable d'environnement GROQ_API_KEY, utilisée en
+    repli si secrets.toml est absent — utile pour un déploiement Docker.)
 
 Limite d'upload :
     La taille maximale des fichiers importés (10 Mo) est fixée au niveau
@@ -47,9 +53,11 @@ Identité visuelle :
     .streamlit/config.toml ([theme]).
 """
 
+from __future__ import annotations
+
 import json
-import re
 import os
+import re
 
 import pandas as pd
 import pdfplumber
@@ -63,11 +71,13 @@ from groq import Groq
 GROQ_MODEL = "llama-3.3-70b-versatile"
 TAILLE_MAX_FICHIER_MO = 10
 TAILLE_MAX_FICHIER_OCTETS = TAILLE_MAX_FICHIER_MO * 1024 * 1024
-CHEMIN_LOGO = "aurelion_logo.jpg"
+CHEMIN_LOGO = os.path.join("assets", "aurelion_logo.jpg")
+LONGUEUR_HISTORIQUE_CHAT = 12  # nombre de messages passés envoyés à l'IA (fenêtre glissante)
 
 # Départements français dont le coût de la vie / logement est jugé très élevé :
-# Île-de-France (75, 77, 78, 91, 92, 93, 94, 95), PACA littoral (06, 13, 83), Corse (20, 2A, 2B), Genevois français (74)
-DEPARTEMENTS_COUT_ELEVE = {"75", "77", "78", "91", "92", "93", "94", "95", "06", "13", "83", "20", "2A", "2B", "74"}
+# Île-de-France (75, 77, 78, 91, 92, 93, 94, 95), PACA littoral (06, 13, 83),
+# Corse (20 -> 2A/2B), Genevois français (74).
+DEPARTEMENTS_COUT_ELEVE = {"75", "77", "78", "91", "92", "93", "94", "95", "06", "13", "83", "74", "20"}
 
 TEXTE_AIDE_TMI = (
     "La Tranche Marginale d'Imposition (TMI) est le taux appliqué à votre dernière tranche "
@@ -75,7 +85,16 @@ TEXTE_AIDE_TMI = (
     "Elle est essentielle pour calculer l'avantage fiscal d'un PER."
 )
 
-st.set_page_config(page_title="Aurelion Wealth Management", page_icon=CHEMIN_LOGO if os.path.exists(CHEMIN_LOGO) else "🪙", layout="centered")
+DISCLAIMER = (
+    "⚠️ Ce diagnostic est **indicatif** et généré automatiquement. Il ne remplace pas "
+    "l'avis d'un conseiller en gestion de patrimoine agréé (CGP)."
+)
+
+st.set_page_config(
+    page_title="Aurelion Wealth Management",
+    page_icon=CHEMIN_LOGO if os.path.exists(CHEMIN_LOGO) else "🪙",
+    layout="centered",
+)
 
 # ----------------------------------------------------------------------
 # IDENTITÉ VISUELLE — Charte noir / or, style minimaliste et sobre
@@ -106,31 +125,53 @@ st.markdown(
 def obtenir_client_groq():
     """
     Initialise (une seule fois, grâce au cache) le client Groq à partir de
-    la clé API stockée dans st.secrets.
+    la clé API stockée dans st.secrets, avec repli sur la variable
+    d'environnement GROQ_API_KEY si secrets.toml est absent.
     """
-    api_key = st.secrets.get("GROQ_API_KEY")
+    api_key = None
+    try:
+        api_key = st.secrets.get("GROQ_API_KEY")
+    except Exception:
+        api_key = None
+    if not api_key:
+        api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
         return None
     return Groq(api_key=api_key)
 
 
-def appeler_groq(prompt: str) -> str:
+def appeler_groq(
+    prompt: str,
+    system: str | None = None,
+    historique: list[dict] | None = None,
+    temperature: float = 0.2,
+    max_tokens: int = 2000,
+) -> str:
     """
-    Envoie un prompt au modèle Groq (llama-3.3-70b-versatile) et retourne
-    le texte généré.
+    Envoie un prompt (et, optionnellement, un message système et un
+    historique de conversation) au modèle Groq et retourne le texte généré.
     """
     client = obtenir_client_groq()
     if client is None:
         st.error(
             "Clé API Groq introuvable. Ajoutez GROQ_API_KEY dans "
-            "les secrets de Streamlit pour activer l'IA."
+            "les secrets de Streamlit (ou en variable d'environnement) pour activer l'IA."
         )
         return ""
+
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    if historique:
+        messages.extend(historique)
+    messages.append({"role": "user", "content": prompt})
+
     try:
         completion = client.chat.completions.create(
             model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
         return (completion.choices[0].message.content or "").strip()
     except Exception as e:
@@ -167,6 +208,9 @@ def extraire_salaire_net(texte_paie: str) -> float | None:
     Demande à Groq d'extraire le "Salaire Net à payer" du texte de la
     fiche de paie et de le renvoyer en JSON strict.
     """
+    if not texte_paie:
+        return None
+
     prompt = f"""Tu es un assistant spécialisé dans la lecture de fiches de paie françaises.
 Voici le texte brut extrait d'une fiche de paie :
 
@@ -184,7 +228,7 @@ après, sans balises Markdown, au format exact suivant :
 Si tu ne trouves aucun montant, réponds avec :
 {{"salaire_net": null}}
 """
-    reponse = appeler_groq(prompt)
+    reponse = appeler_groq(prompt, temperature=0.0, max_tokens=200)
     if not reponse:
         return None
 
@@ -200,6 +244,24 @@ Si tu ne trouves aucun montant, réponds avec :
     except (json.JSONDecodeError, TypeError, ValueError):
         st.warning("Impossible de parser le JSON renvoyé par l'IA.")
         return None
+
+
+# ----------------------------------------------------------------------
+# LOCALISATION — Estimation de la zone de coût de la vie
+# ----------------------------------------------------------------------
+def obtenir_zone_cout_vie(code_postal: str) -> tuple[str, bool]:
+    """
+    Détermine la zone de coût de la vie ("Élevé" / "Standard") à partir
+    des deux premiers chiffres du code postal. Retourne aussi un booléen
+    indiquant si le code postal saisi est valide (5 chiffres).
+    """
+    chiffres = re.sub(r"\D", "", code_postal or "")
+    valide = len(chiffres) == 5
+    if not valide:
+        return "Standard", False
+    dept = chiffres[:2]
+    zone = "Élevé" if dept in DEPARTEMENTS_COUT_ELEVE else "Standard"
+    return zone, True
 
 
 # ----------------------------------------------------------------------
@@ -465,7 +527,8 @@ def generer_rapport(
 
     localisation_txt = f"Code postal {localisation['code_postal']}"
 
-    prompt = f"""Tu es un conseiller en gestion de patrimoine, direct et rigoureux. Ton style est concis : pas de paragraphes longs, va à l'essentiel.
+    system_prompt = f"""Tu es un conseiller en gestion de patrimoine, direct et rigoureux, pour Aurelion Wealth Management.
+Ton style est concis : pas de paragraphes longs, va à l'essentiel.
 Adapte ton niveau de vocabulaire au niveau de connaissances financières de l'utilisateur : {niveau_connaissance}.
 Adapte tes conseils retraite/prévoyance et ta gestion de la trésorerie selon le statut professionnel.
 
@@ -473,9 +536,10 @@ Respecte STRICTEMENT les règles d'allocation suivantes, sans jamais les contred
 - N'invente jamais une ligne d'allocation mensuelle inférieure à 50 € (sauf 0 €).
 - Si l'épargne de précaution affichée est à 0 €, explique que la cible de mois de couverture est déjà atteinte.
 - Le PER n'est proposé que si le matelas de sécurité est rempli ET la TMI ≥ 30%.
+- Commence le rapport par une phrase précisant que ce diagnostic est indicatif et ne remplace pas l'avis d'un conseiller en gestion de patrimoine agréé.
+- Réponds uniquement avec le rapport en Markdown, sans texte avant ou après."""
 
-Rédige un rapport en Markdown à partir des données suivantes.
-Commence par une phrase précisant que ce diagnostic est indicatif et ne remplace pas l'avis d'un conseiller en gestion de patrimoine agréé.
+    prompt = f"""Rédige un rapport en Markdown à partir des données suivantes.
 
 IDENTITÉ & FOYER :
 - Âge : {identite['age']} ans
@@ -535,10 +599,8 @@ Tableau Markdown (Allocation | Montant en € | % de la capacité d'épargne) re
 Un court paragraphe "Contexte de marché" (3-4 phrases maximum).
 Section "Dans quoi investir concrètement" : pour chaque ligne du Temps 2, nomme 1 à 2 supports précis.
 "Feuille de route" : liste numérotée de 3 à 5 actions concrètes à réaliser dès ce mois-ci.
-
-Réponds uniquement avec le rapport en Markdown.
 """
-    return appeler_groq(prompt)
+    return appeler_groq(prompt, system=system_prompt, temperature=0.2, max_tokens=1800)
 
 
 # ----------------------------------------------------------------------
@@ -546,6 +608,8 @@ Réponds uniquement avec le rapport en Markdown.
 # ----------------------------------------------------------------------
 if "resultat" not in st.session_state:
     st.session_state.resultat = None
+if "messages_chat" not in st.session_state:
+    st.session_state.messages_chat = []
 
 
 # ----------------------------------------------------------------------
@@ -557,11 +621,16 @@ with col_logo:
         st.image(CHEMIN_LOGO, width=88)
 with col_titre:
     st.markdown("<h1 style='margin-bottom:0;'>Aurelion Wealth Management</h1>", unsafe_allow_html=True)
-    st.caption("Diagnostic budgétaire et plan d'investissement personnalisés, propulsés par l'IA (Groq).")
+    st.caption("Diagnostic budgétaire, plan d'investissement et conseiller IA, propulsés par Groq.")
 st.divider()
 
-etape1, etape2, etape3 = st.tabs(
-    ["Étape 1 — Situation & Documents", "Étape 2 — Profil de risque (optionnel)", "Étape 3 — Diagnostic & Plan"]
+etape1, etape2, etape3, etape4 = st.tabs(
+    [
+        "Étape 1 — Situation & Documents",
+        "Étape 2 — Profil de risque (optionnel)",
+        "Étape 3 — Diagnostic & Plan",
+        "💬 Étape 4 — Discuter avec l'IA",
+    ]
 )
 
 
@@ -591,6 +660,7 @@ with etape1:
             max_value=10.0,
             value=float(nb_adultes + (nb_enfants * 0.5)),
             step=0.5,
+            help="Pré-rempli à partir du nombre d'adultes/enfants ; ajustez si votre situation fiscale diffère.",
         )
 
     handicap = st.checkbox("Handicap ou frais médicaux récurrents importants dans le foyer")
@@ -625,13 +695,12 @@ with etape1:
 
     with col_cp:
         code_postal = st.text_input("Code Postal (France) *", value="75001", max_chars=5)
-        # Détection automatique du coût de la vie selon les 2 premiers chiffres du code postal (département)
-        dept = code_postal.strip()[:2]
-        if dept in DEPARTEMENTS_COUT_ELEVE:
-            zone_cout_vie = "Élevé"
+        zone_cout_vie, cp_valide = obtenir_zone_cout_vie(code_postal)
+        if not cp_valide:
+            st.warning("Code postal invalide (5 chiffres attendus). Zone de coût de la vie estimée par défaut : Standard.")
+        elif zone_cout_vie == "Élevé":
             st.caption("📍 Zone à coût de la vie élevé détectée (ajustement automatique du budget).")
         else:
-            zone_cout_vie = "Standard"
             st.caption("📍 Zone à coût de la vie standard.")
 
     st.markdown("---")
@@ -690,6 +759,8 @@ with etape1:
                     salaire_net_extrait = extraire_salaire_net(texte)
                     if salaire_net_extrait:
                         st.success(f"Salaire net identifié : **{salaire_net_extrait:.2f} €**")
+                    else:
+                        st.warning("Aucun salaire net n'a pu être identifié automatiquement. Saisissez-le manuellement ci-dessous.")
 
     col_rev1, col_rev2 = st.columns(2)
     with col_rev1:
@@ -743,12 +814,20 @@ with etape2:
 
     profil_risque, score_risque = calculer_profil_risque(reponses_qcm)
 
+    if activer_qcm:
+        st.markdown("---")
+        st.metric("Profil de risque estimé", profil_risque, help=f"Score moyen : {score_risque}/3")
+
 
 # ----------------------------------------------------------------------
 # ÉTAPE 3 — DIAGNOSTIC & GENERATION GROQ
 # ----------------------------------------------------------------------
 with etape3:
     st.subheader("Diagnostic Budgétaire & Plan d'Investissement")
+    st.caption(DISCLAIMER)
+
+    if not cp_valide:
+        st.info("Renseignez un code postal valide (5 chiffres) dans l'Étape 1 pour affiner le diagnostic.")
 
     if st.button("Lancer l'analyse IA", type="primary"):
         with st.spinner("Analyse patrimoniale et génération du rapport par Groq..."):
@@ -833,6 +912,179 @@ with etape3:
                 "temps1": temps1,
                 "temps2": temps2,
                 "rapport": rapport_md,
+                "profil_risque": profil_risque,
             }
 
-    # Affichage des résultats
+    # ------------------------------------------------------------------
+    # Affichage des résultats (corrigé : c'était manquant dans la version
+    # d'origine — le rapport était calculé mais jamais montré à l'écran)
+    # ------------------------------------------------------------------
+    if st.session_state.resultat:
+        resultat = st.session_state.resultat
+        temps1 = resultat["temps1"]
+        temps2 = resultat["temps2"]
+        rapport = resultat["rapport"]
+
+        st.markdown("---")
+
+        if temps1["deficit"]:
+            st.error(
+                f"⚠️ Votre budget est en déficit de {abs(temps1['reste_a_vivre_brut']):.2f} € ce mois-ci, "
+                "avant même de compter les Plaisirs. Le rapport ci-dessous en tient compte."
+            )
+
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        col_m1.metric("Revenu total", f"{temps1['revenu_total']:.0f} €")
+        col_m2.metric("Dépenses essentielles", f"{temps1['depenses_essentielles']:.0f} €")
+        col_m3.metric("Plaisirs (plafonné)", f"{temps1['plaisirs']:.0f} €")
+        col_m4.metric("Capacité d'épargne", f"{temps1['capacite_epargne']:.0f} €")
+
+        col_g1, col_g2 = st.columns(2)
+
+        with col_g1:
+            labels_t1 = ["Dépenses essentielles", "Impôts", "Plaisirs", "Capacité d'épargne"]
+            valeurs_t1 = [
+                temps1["depenses_essentielles"],
+                temps1["impots_mensuels"],
+                temps1["plaisirs"],
+                temps1["capacite_epargne"],
+            ]
+            fig1 = go.Figure(
+                data=[
+                    go.Pie(
+                        labels=labels_t1,
+                        values=valeurs_t1,
+                        hole=0.45,
+                        marker=dict(colors=["#7A7A7A", "#4A4A4A", "#D4AF6A", "#B8943F"]),
+                    )
+                ]
+            )
+            fig1.update_layout(title="Répartition du revenu (Temps 1)", showlegend=True, margin=dict(t=50, b=10))
+            st.plotly_chart(fig1, use_container_width=True)
+
+        with col_g2:
+            labels_t2 = ["Épargne de précaution", "PER", "Invest. long terme"]
+            valeurs_t2 = [temps2["montant_matelas"], temps2["montant_per"], temps2["montant_invest_long_terme"]]
+            if sum(valeurs_t2) > 0:
+                fig2 = go.Figure(
+                    data=[go.Bar(x=labels_t2, y=valeurs_t2, marker_color=["#D4AF6A", "#B8943F", "#0B0B0B"])]
+                )
+                fig2.update_layout(title="Allocation de l'épargne (Temps 2)", yaxis_title="€ / mois", margin=dict(t=50, b=10))
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("Aucune capacité d'épargne disponible ce mois-ci à allouer.")
+
+        with st.expander("📊 Détail chiffré (tableau)"):
+            df_synthese = pd.DataFrame(
+                {
+                    "Poste": [
+                        "Dépenses essentielles",
+                        "Impôts estimés",
+                        "Plaisirs (plafonné)",
+                        "Épargne de précaution",
+                        "PER",
+                        "Investissement long terme",
+                    ],
+                    "Montant (€/mois)": [
+                        temps1["depenses_essentielles"],
+                        temps1["impots_mensuels"],
+                        temps1["plaisirs"],
+                        temps2["montant_matelas"],
+                        temps2["montant_per"],
+                        temps2["montant_invest_long_terme"],
+                    ],
+                }
+            )
+            st.dataframe(df_synthese, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        if rapport:
+            st.markdown(rapport)
+            st.download_button(
+                "📥 Télécharger le rapport (Markdown)",
+                data=rapport,
+                file_name="diagnostic_aurelion.md",
+                mime="text/markdown",
+            )
+        else:
+            st.warning("Le rapport détaillé n'a pas pu être généré (vérifiez la clé API Groq). Les chiffres ci-dessus restent disponibles.")
+
+
+# ----------------------------------------------------------------------
+# ÉTAPE 4 — DISCUSSION LIBRE AVEC L'IA (NOUVEAU)
+# ----------------------------------------------------------------------
+with etape4:
+    st.subheader("💬 Discutez avec votre conseiller IA")
+    st.caption(
+        "Posez vos questions sur vos finances, un projet d'investissement, la fiscalité, etc. "
+        "Si vous avez généré un diagnostic (Étape 3), l'IA s'en sert comme contexte."
+    )
+    st.caption(DISCLAIMER)
+
+    col_reset, _ = st.columns([1, 3])
+    with col_reset:
+        if st.button("🗑️ Nouvelle conversation"):
+            st.session_state.messages_chat = []
+            st.rerun()
+
+    # Construction du contexte injecté dans le message système, à partir
+    # du dernier diagnostic généré (s'il existe).
+    if st.session_state.resultat:
+        t1 = st.session_state.resultat["temps1"]
+        t2 = st.session_state.resultat["temps2"]
+        profil = st.session_state.resultat.get("profil_risque", "Non renseigné")
+        contexte_diagnostic = f"""Voici le dernier diagnostic budgétaire du client, à utiliser comme contexte pour toute réponse :
+- Revenu total mensuel : {t1['revenu_total']:.2f} €
+- Dépenses essentielles : {t1['depenses_essentielles']:.2f} €
+- Capacité d'épargne mensuelle : {t1['capacite_epargne']:.2f} €
+- Épargne de précaution recommandée : {t2['montant_matelas']:.2f} €
+- PER recommandé : {t2['montant_per']:.2f} €
+- Investissement long terme recommandé : {t2['montant_invest_long_terme']:.2f} €
+- Profil de risque : {profil}
+Base tes réponses sur ces chiffres quand la question du client s'y prête, sans les répéter inutilement."""
+    else:
+        contexte_diagnostic = (
+            "Le client n'a pas encore généré de diagnostic budgétaire complet (Étape 3). "
+            "Réponds de façon générale et, si pertinent, invite-le à compléter le diagnostic "
+            "pour obtenir des conseils plus précis."
+        )
+
+    system_prompt_chat = f"""Tu es un conseiller en gestion de patrimoine pour Aurelion Wealth Management.
+Tu réponds de façon claire, concise, professionnelle et pédagogique, en français.
+Rappelle que tes réponses sont indicatives et ne remplacent pas l'avis d'un conseiller en gestion de
+patrimoine agréé, en particulier pour toute décision d'investissement importante.
+Ne conseille jamais d'investir l'épargne de précaution recommandée, ni de prendre des risques
+disproportionnés par rapport au profil du client.
+
+{contexte_diagnostic}
+"""
+
+    # Historique affiché
+    for msg in st.session_state.messages_chat:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    question = st.chat_input("Posez votre question ici (ex : dois-je privilégier un PEA ou une assurance-vie ?)")
+    if question:
+        st.session_state.messages_chat.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Réflexion en cours..."):
+                # Historique envoyé à l'API : tout sauf le message qu'on vient
+                # d'ajouter (passé séparément via `prompt`), limité à une
+                # fenêtre glissante pour contenir la taille du contexte.
+                historique_pour_api = st.session_state.messages_chat[:-1][-LONGUEUR_HISTORIQUE_CHAT:]
+                reponse = appeler_groq(
+                    prompt=question,
+                    system=system_prompt_chat,
+                    historique=historique_pour_api,
+                    temperature=0.3,
+                    max_tokens=1200,
+                )
+                if reponse:
+                    st.markdown(reponse)
+                    st.session_state.messages_chat.append({"role": "assistant", "content": reponse})
+                else:
+                    st.warning("La réponse n'a pas pu être générée. Vérifiez votre clé API Groq et réessayez.")
